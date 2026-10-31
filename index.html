@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111418">
+<title>Clip bilanciere</title>
+<style>
+  :root { --bg:#111418; --card:#1b2027; --fg:#e8ecf1; --mut:#8a94a3; --a:#4fa3ff; --b:#ffb347; --z:#7bd88f; --bad:#ff6b6b; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:12px 16px; display:flex; align-items:center; justify-content:space-between; }
+  h1 { font-size:18px; margin:0; }
+  #conn { font-size:13px; color:var(--mut); }
+  main { padding:0 12px 24px; display:grid; gap:12px; }
+  .card { background:var(--card); border-radius:12px; padding:12px; }
+  .row { display:flex; gap:8px; }
+  button { flex:1; font-size:17px; padding:14px; border:0; border-radius:10px; background:#2b3440; color:var(--fg); }
+  button.primary { background:var(--a); color:#06121f; font-weight:600; }
+  button.rec { background:#c0392b; font-weight:600; }
+  button:disabled { opacity:.35; }
+  .big { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; text-align:center; }
+  .big div span { display:block; font-size:30px; font-variant-numeric:tabular-nums; }
+  .big div small { color:var(--mut); font-size:12px; }
+  canvas { width:100%; height:220px; display:block; }
+  .legend { display:flex; gap:14px; font-size:12px; color:var(--mut); margin-top:4px; }
+  .legend i { display:inline-block; width:10px; height:3px; margin-right:4px; vertical-align:middle; }
+  table { width:100%; font-size:13px; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  td { padding:3px 0; } td:last-child { text-align:right; }
+  .bad { color:var(--bad); }
+  #log { font: 12px ui-monospace, monospace; color:var(--mut); white-space:pre-wrap; max-height:120px; overflow:auto; }
+  #recstate { font-size:13px; color:var(--mut); margin-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Clip bilanciere</h1>
+  <div id="conn">non connessa</div>
+</header>
+<main>
+  <div class="card">
+    <div class="row">
+      <button id="bConnect" class="primary">Connetti</button>
+      <button id="bDisconnect" disabled>Disconnetti</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="bStart" class="rec" disabled>Avvia serie</button>
+      <button id="bStop" disabled>Ferma serie</button>
+    </div>
+    <div id="recstate">—</div>
+  </div>
+
+  <div class="card big">
+    <div><span id="vA">—</span><small>laser A [mm]</small></div>
+    <div><span id="vB">—</span><small>laser B [mm]</small></div>
+    <div><span id="vZ">—</span><small>acc. verticale [m/s²]</small></div>
+  </div>
+
+  <div class="card">
+    <canvas id="plot"></canvas>
+    <div class="legend">
+      <span><i style="background:var(--a)"></i>laser A</span>
+      <span><i style="background:var(--b)"></i>laser B</span>
+      <span><i style="background:var(--z)"></i>acc. verticale (scala a destra)</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <table id="stats"></table>
+    <div class="row" style="margin-top:8px">
+      <button id="bCsv" disabled>Scarica CSV della serie</button>
+    </div>
+  </div>
+
+  <div class="card"><div id="log"></div></div>
+</main>
+
+<script>
+// ---------------------------------------------------------------- protocollo (vedi clip-fw/main/ble.h)
+const uuid = x => `4b2a00${x}-8f3e-4c55-9e1a-6d2f3c1b0a00`;
+const SVC = uuid('01'), CMD = uuid('02'), STAT = uuid('03'), DATA = uuid('04');
+// record v1: tipo, u16 seq, u32 t_us, poi Q: 4×i16 (Q14), L: 3×i16 (Q8), A/B: u16 mm + u8 status
+const SIZE = { 81: 15, 76: 13, 65: 10, 66: 10 };   // 'Q','L','A','B'
+
+let dev, cCmd, wakeLock = null;
+const enc = new TextEncoder(), dec = new TextDecoder();
+const $ = id => document.getElementById(id);
+
+// ---------------------------------------------------------------- stato e statistiche
+const S = {};
+function resetStats() {
+  Object.assign(S, { pkts: 0, pktLost: 0, lastPkt: -1, bytes: 0, t0: performance.now(),
+    n: { Q: 0, L: 0, A: 0, B: 0 }, gaps: { Q: 0, L: 0, A: 0, B: 0 }, last: {},
+    q: [1, 0, 0, 0], rec: false, series: null });
+}
+resetStats();
+
+// buffer circolari per il grafico (ultimi 10 s)
+const WIN = 10e6;
+const buf = { A: [], B: [], Z: [] };
+function pushBuf(k, t, v) { const b = buf[k]; b.push([t, v]); while (b.length && t - b[0][0] > WIN) b.shift(); }
+
+// ---------------------------------------------------------------- parsing dei pacchetti
+function onData(ev) {
+  const dv = ev.target.value;
+  const p = dv.getUint16(0, true);
+  if (S.lastPkt >= 0) S.pktLost += (p - S.lastPkt - 1 + 65536) % 65536;
+  S.lastPkt = p; S.pkts++; S.bytes += dv.byteLength;
+  let i = 2;
+  while (i < dv.byteLength) {
+    const ty = dv.getUint8(i), n = SIZE[ty];
+    if (!n || i + n > dv.byteLength) { log('pacchetto malformato'); break; }
+    const k = String.fromCharCode(ty), seq = dv.getUint16(i + 1, true), t = dv.getUint32(i + 3, true);
+    if (S.last[k] !== undefined) S.gaps[k] += (seq - S.last[k] - 1 + 65536) % 65536;
+    S.last[k] = seq; S.n[k]++;
+    if (k === 'Q') {
+      S.q = [0, 1, 2, 3].map(j => dv.getInt16(i + 7 + 2 * j, true) / 16384);
+      if (S.series) S.series.push(`Q,${seq},${t},${S.q.map(x => x.toFixed(5)).join(',')}`);
+    } else if (k === 'L') {
+      const a = [0, 1, 2].map(j => dv.getInt16(i + 7 + 2 * j, true) / 256);
+      const z = vertical(S.q, a);
+      pushBuf('Z', t, z); $('vZ').textContent = z.toFixed(2);
+      if (S.series) S.series.push(`L,${seq},${t},${a.map(x => x.toFixed(3)).join(',')}`);
+    } else {
+      const mm = dv.getUint16(i + 7, true), st = dv.getUint8(i + 9);
+      pushBuf(k, t, mm); $('v' + k).textContent = mm;
+      if (S.series) S.series.push(`${k},${seq},${t},${mm},${st}`);
+    }
+    i += n;
+  }
+}
+
+// componente verticale (asse z del riferimento del game RV) dell'accelerazione lineare:
+// a_mondo = q a q*, si calcola solo la terza riga della matrice di rotazione
+function vertical([w, x, y, z], [ax, ay, az]) {
+  return 2 * (x * z - w * y) * ax + 2 * (y * z + w * x) * ay + (1 - 2 * (x * x + y * y)) * az;
+}
+
+// ---------------------------------------------------------------- messaggi di stato
+function onStat(ev) {
+  const line = dec.decode(ev.target.value);
+  if (line.startsWith('REC,START')) { S.rec = true; S.series = ['tipo,seq,t_us,v1,v2,v3,v4']; }
+  if (line.startsWith('REC,FLUSH') || line.startsWith('REC,STOP')) S.rec = false;
+  if (line.startsWith('REC,')) $('recstate').textContent = line;
+  if (!line.startsWith('S,') && !line.startsWith('T,')) log(line);
+  updateButtons();
+}
+
+function log(s) {
+  const el = $('log');
+  el.textContent = (new Date().toLocaleTimeString() + ' ' + s + '\n' + el.textContent).slice(0, 3000);
+}
+
+// ---------------------------------------------------------------- connessione
+async function connect() {
+  try {
+    dev = await navigator.bluetooth.requestDevice({ filters: [{ services: [SVC] }] });
+    dev.addEventListener('gattserverdisconnected', onDisconnected);
+    $('conn').textContent = 'connessione…';
+    const srv = await dev.gatt.connect();
+    const svc = await srv.getPrimaryService(SVC);
+    cCmd = await svc.getCharacteristic(CMD);
+    const cStat = await svc.getCharacteristic(STAT), cData = await svc.getCharacteristic(DATA);
+    cStat.addEventListener('characteristicvaluechanged', onStat);
+    cData.addEventListener('characteristicvaluechanged', onData);
+    await cStat.startNotifications();
+    resetStats();
+    await cData.startNotifications();
+    $('conn').textContent = 'connessa: ' + (dev.name || 'CLIP');
+    log('connessa');
+    keepAwake();
+  } catch (e) {
+    log('errore: ' + e.message);
+    $('conn').textContent = 'non connessa';
+  }
+  updateButtons();
+}
+
+function onDisconnected() {
+  $('conn').textContent = 'disconnessa';
+  log('disconnessa');
+  cCmd = null;
+  updateButtons();
+}
+
+async function send(cmd) {
+  try { await cCmd.writeValueWithResponse(enc.encode(cmd)); }
+  catch (e) { log('errore invio ' + cmd + ': ' + e.message); }
+}
+
+function updateButtons() {
+  const on = !!cCmd;
+  $('bConnect').disabled = on;
+  $('bDisconnect').disabled = !on;
+  $('bStart').disabled = !on || S.rec;
+  $('bStop').disabled = !on || !S.rec;
+  $('bCsv').disabled = !(S.series && S.series.length > 1);
+}
+
+// schermo sempre acceso (Wake Lock): si riacquisisce quando la pagina torna visibile
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock.request('screen'); }
+  catch (e) { log('Wake Lock non disponibile: ' + e.message); }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && cCmd) keepAwake();
+});
+
+function downloadCsv() {
+  const blob = new Blob([S.series.join('\n') + '\n'], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'serie_' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.csv';
+  a.click();
+}
+
+$('bConnect').onclick = connect;
+$('bDisconnect').onclick = () => dev && dev.gatt.disconnect();
+$('bStart').onclick = () => send('start');
+$('bStop').onclick = () => send('stop');
+$('bCsv').onclick = downloadCsv;
+if (!navigator.bluetooth) log('questo browser non supporta Web Bluetooth: usa Chrome su Android');
+
+// ---------------------------------------------------------------- statistiche e grafico
+function renderStats() {
+  const dt = (performance.now() - S.t0) / 1000;
+  const rows = [
+    ['pacchetti ricevuti', S.pkts],
+    ['pacchetti persi', S.pktLost, S.pktLost > 0],
+    ['banda', (S.bytes / dt / 1024).toFixed(2) + ' kB/s'],
+    ['IMU (Q / L)', `${(S.n.Q / dt).toFixed(1)} / ${(S.n.L / dt).toFixed(1)} Hz`],
+    ['laser (A / B)', `${(S.n.A / dt).toFixed(1)} / ${(S.n.B / dt).toFixed(1)} Hz`],
+    ['campioni mancanti Q L A B', `${S.gaps.Q} ${S.gaps.L} ${S.gaps.A} ${S.gaps.B}`,
+      S.gaps.Q + S.gaps.L + S.gaps.A + S.gaps.B > 0],
+    ['schermo sempre acceso', wakeLock && !wakeLock.released ? 'sì' : 'no'],
+  ];
+  $('stats').innerHTML = rows.map(([k, v, bad]) => `<tr><td>${k}</td><td class="${bad ? 'bad' : ''}">${v}</td></tr>`).join('');
+}
+
+const cv = $('plot'), ctx = cv.getContext('2d');
+function draw() {
+  const dpr = devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  if (cv.width !== W * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const all = [...buf.A, ...buf.B];
+  if (all.length) {
+    const tEnd = Math.max(...[buf.A, buf.B, buf.Z].map(b => b.length ? b[b.length - 1][0] : 0));
+    let lo = Math.min(...all.map(p => p[1])), hi = Math.max(...all.map(p => p[1]));
+    if (hi - lo < 50) { const m = (hi + lo) / 2; lo = m - 25; hi = m + 25; }
+    const X = t => W * (1 - (tEnd - t) / WIN);
+    const line = (b, color, y) => {
+      ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath();
+      b.forEach(([t, v], j) => j ? ctx.lineTo(X(t), y(v)) : ctx.moveTo(X(t), y(v)));
+      ctx.stroke();
+    };
+    const Yd = v => H - 8 - (H - 16) * (v - lo) / (hi - lo);
+    const Yz = v => H / 2 - (H / 2 - 8) * Math.max(-1, Math.min(1, v / 10));   // ±10 m/s²
+    ctx.strokeStyle = '#2b3440'; ctx.beginPath(); ctx.moveTo(0, H / 2); ctx.lineTo(W, H / 2); ctx.stroke();
+    line(buf.Z, '#7bd88f', Yz);
+    line(buf.A, '#4fa3ff', Yd);
+    line(buf.B, '#ffb347', Yd);
+    ctx.fillStyle = '#8a94a3'; ctx.font = '11px system-ui';
+    ctx.fillText(hi.toFixed(0) + ' mm', 4, 12); ctx.fillText(lo.toFixed(0) + ' mm', 4, H - 4);
+    ctx.textAlign = 'right'; ctx.fillText('+10', W - 4, 12); ctx.fillText('−10 m/s²', W - 4, H - 4); ctx.textAlign = 'left';
+  }
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+setInterval(renderStats, 500);
+renderStats();
+</script>
+</body>
+</html>
