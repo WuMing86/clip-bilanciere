@@ -118,16 +118,16 @@ function onData(ev) {
     S.last[k] = seq; S.n[k]++;
     if (k === 'Q') {
       S.q = [0, 1, 2, 3].map(j => dv.getInt16(i + 7 + 2 * j, true) / 16384);
-      if (S.series) S.series.push(`Q,${seq},${t},${S.q.map(x => x.toFixed(5)).join(',')}`);
+      if (S.rec) S.series.push(`Q,${seq},${t},${S.q.map(x => x.toFixed(5)).join(',')}`);
     } else if (k === 'L') {
       const a = [0, 1, 2].map(j => dv.getInt16(i + 7 + 2 * j, true) / 256);
       const z = vertical(S.q, a);
       pushBuf('Z', t, z); $('vZ').textContent = z.toFixed(2);
-      if (S.series) S.series.push(`L,${seq},${t},${a.map(x => x.toFixed(3)).join(',')}`);
+      if (S.rec) S.series.push(`L,${seq},${t},${a.map(x => x.toFixed(3)).join(',')}`);
     } else {
       const mm = dv.getUint16(i + 7, true), st = dv.getUint8(i + 9);
       pushBuf(k, t, mm); $('v' + k).textContent = mm;
-      if (S.series) S.series.push(`${k},${seq},${t},${mm},${st}`);
+      if (S.rec) S.series.push(`${k},${seq},${t},${mm},${st}`);
     }
     i += n;
   }
@@ -143,6 +143,8 @@ function vertical([w, x, y, z], [ax, ay, az]) {
 function onStat(ev) {
   const line = dec.decode(ev.target.value);
   if (line.startsWith('REC,START')) { S.rec = true; S.series = ['tipo,seq,t_us,v1,v2,v3,v4']; }
+  // la serie finisce a REC,FLUSH: dopo, la copia in flash blocca la clip per qualche secondo e
+  // lo streaming ha dei buchi, che non appartengono alla serie
   if (line.startsWith('REC,FLUSH') || line.startsWith('REC,STOP')) S.rec = false;
   if (line.startsWith('REC,')) $('recstate').textContent = line;
   if (!line.startsWith('S,') && !line.startsWith('T,')) log(line);
